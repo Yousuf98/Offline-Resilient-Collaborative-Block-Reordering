@@ -2,6 +2,10 @@
 
 ## Quick Start
 
+Open [this link](https://offline-resilient-collaborative-blo.vercel.app/) in two tabs.
+
+Or run locally:
+
 ```bash
 npm install
 npm run dev        # open in two tabs at http://localhost:5173
@@ -11,35 +15,28 @@ npm run dev        # open in two tabs at http://localhost:5173
 
 ## Ordering Strategy — Fractional Indexing
 
-Every block carries a **rank**: a decimal string in the open interval `(0, 1)`
-(e.g. `"0.5"`, `"0.25"`, `"0.625"`). The visible list is always sorted by
-rank using standard lexicographic string comparison, which agrees with numeric
-order for strings produced by our `midpoint()` helper.
+Every block carries a position (**pos**): a string built from a base-62 character set (0-9, a-z, A-Z). The visible list is always sorted by this string using standard lexicographic comparison.
 
-**Inserting between two neighbours** computes `(lo + hi) / 2` to 20 decimal
-places. Precision grows lazily; for the number of blocks in this exercise
-collisions are mathematically impossible.
+**Inserting between two neighbours** calculates the midpoint character between the two bounding position strings. If no gap exists at the current string index, the algorithm appends a new character to the string (creating a smaller subdivision).
 
-No integer positions are stored. Two concurrent moves to different positions
-produce two distinct rank strings that compare unambiguously.
+No integer or floating-point positions are stored. Two concurrent moves to different positions produce distinct strings that compare unambiguously. Because strings can grow in length to create new subdivisions, collisions float exhaustion is not a concern.
 
 ---
 
 ## Operation Format
 
 ```ts
-interface MoveOp {
-  opId: string; // UUID v4 — globally unique, used for deduplication
-  clientId: string; // UUID assigned once per tab via sessionStorage
+type MoveOperation = {
+  id: string; // UUID v4 — globally unique, used for deduplication
+  actorId: string; // UUID assigned once per tab via sessionStorage
   lamport: number; // Lamport logical clock value at op creation
   blockId: string; // which block moved
-  newRank: string; // the fractional rank assigned by this tab
-  timestamp: number; // wall-clock ms (display only)
-}
+  newPos: string; // the fractional position assigned by this tab
+};
 ```
 
-`(clientId, lamport)` together provide a total causal order.
-`opId` ensures idempotent replay — applying the same op twice has no effect.
+`(actorId, lamport)` together provide a total causal order.
+`id` ensures idempotent replay — applying the same op twice has no effect.
 
 ---
 
@@ -48,12 +45,11 @@ interface MoveOp {
 **Per-block winner selection** (not last-write-wins for the whole list):
 
 > For a given `blockId`, the op with the **highest Lamport timestamp** wins.
-> Tie-break: the op with the **lexicographically higher `clientId`** wins.
-> The winning op's `newRank` is applied. Ops on _different_ blocks never
+> Tie-break: the op with the **lexicographically higher `actorId`** wins.
+> The winning op's `newPos` is applied. Ops on _different_ blocks never
 > conflict — both apply independently.
 
-The current block list is always **derived from the full oplog**, so adding
-new ops never requires reprocessing earlier history from scratch.
+The current block list is always **derived from the full oplog**, meaning adding new ops never requires complicated rollbacks—we simply evaluate the highest priority operation for each block ID.
 
 ---
 
@@ -62,29 +58,26 @@ new ops never requires reprocessing earlier history from scratch.
 ### Scenario 1 — Both tabs move the same block concurrently
 
 ```
-Tab A (id "aaa")  |  Tab B (id "bbb")
-──────────────────|──────────────────────
-L=1 move block-b → rank 0.75
-                  |  L=1 move block-b → rank 0.25
-[reconnect / CATCHUP]
+Tab A (id "aaa")           |  Tab B (id "bbb")
+───────────────────────────|───────────────────────────────
+L=1 move block-2 → pos 'm' |  L=1 move block-2 → pos 'k'
+[reconnect / syncReq]
 ```
 
-Both tabs receive both ops. Tie-break: `"bbb" > "aaa"` → Op B wins → rank
-`0.25` applied identically on both tabs.
+Both tabs receive both operations. Tie-break: `"bbb" > "aaa"` → Op B wins → position `'k'` is applied identically on both tabs.
 
 ### Scenario 2 — Offline tab accumulates moves while online tab also moves
 
 ```
-Tab A (online)     |  Tab B (offline)
-───────────────────|───────────────────
-L=1 move block-c → 0.8
-                   |  L=1 move block-a → 0.9  (queued)
-                   |  L=2 move block-c → 0.3  (queued)
-[Tab B reconnects, broadcasts CATCHUP]
+Tab A (online)              |  Tab B (offline)
+────────────────────────────|──────────────────────────────
+L=1 move block-3 → pos 'r'  |  L=1 move block-1 → pos 's' (queued)
+                            |  L=2 move block-3 → pos 'h' (queued)
+[Tab B reconnects, broadcasts offline ops + syncReq]
 ```
 
-- `block-a`: only Tab B touched it → rank `0.9` (no conflict)
-- `block-c`: Tab A at L=1, Tab B at L=2 → Tab B wins (higher lamport) → rank `0.3`
+- block-1: Only Tab B touched it → pos 's' applied (no conflict).
+- block-3: Tab A is at L=1, Tab B is at L=2 → Tab B wins (higher lamport) → pos 'h' applied.
 
 Result is identical on both tabs.
 
@@ -92,27 +85,22 @@ Result is identical on both tabs.
 
 ## Offline Catch-Up Behaviour
 
-1. **Go Offline** — ops saved to IndexedDB `pending_ops`, scoped by `clientId`.
-2. **Reorder blocks** — optimistic local UI; nothing broadcast.
-3. **Refresh the tab** — `sessionStorage` preserves `clientId`; pending ops
-   are replayed locally on boot so the tab sees its own queued state.
-4. **Go Online** — `reconnect()` broadcasts a `CATCHUP` message with all
-   pending ops, then clears the local queue and updates `shared_state`.
-
-**Isolation**: pending ops are filtered by `clientId`. One tab's offline work
-is never exposed to another tab on reload.
-
-**Bootstrap**: `shared_state` in IndexedDB is updated on every online op.
-A newly opened tab reads it immediately, starting from the latest agreed
-order rather than hard-coded defaults.
+1. **Go Offline** — Operations are routed to the offlineOps store in IndexedDB.
+2. **Reorder blocks** — Optimistic local UI updates instantly; nothing is broadcasted.
+3. **Refresh the tab** — sessionStorage preserves the clientId. On boot, replayOperations() pulls from both remoteOps and offlineOps, allowing the user to seamlessly see their un-synced offline state.
+4. **Go Online** —
+   - Iterates through offlineOps, moves them to remoteOps, and broadcasts them individually (type: "op").
+   - Broadcasts a syncReq message to request any missed state.
+   - Remote tabs reply with syncRes containing their remoteOps, bringing this tab fully up to date.
 
 ---
 
 ## Known Limitations / Trade-offs
 
-| Concern                  | Current behaviour                                                                                                         |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| Rank exhaustion          | After ~50 moves between the same neighbours, float precision is reached. A real app would periodically rebalance ranks.   |
-| Oplog growth             | The log is never compacted. A snapshot + truncation strategy would be needed for long sessions.                           |
-| Winner rule is per-block | Both concurrent orderings are "valid"; the winner rule picks one consistently but may not match either tab's full intent. |
-| No auth                  | `clientId` is a random UUID. Production would replace it with real user identity.                                         |
+| Concern                  | Current behaviour                                                                                                                                                                                                          |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| String length growth     | Continuously moving blocks between the same neighbours without a gap will cause the position strings to grow indefinitely in length. A production app would need a periodic re-indexing/re-balancing job.                  |
+| Broadcast storms         | Emitting a syncReq forces every connected tab to respond with a syncRes payload. If multiple tabs are open, they will all reply with the full history. This could be mitigated using debouncing or simple leader-election. |
+| Oplog growth             | The operation log is never compacted. A snapshot + truncation strategy would be needed for long-lived collaborative sessions.                                                                                              |
+| Winner rule is per-block | Both concurrent orderings are "valid"; the winner rule picks one consistently but may not match either tab's full intent.                                                                                                  |
+| Unbatched offline sync   | Reconnecting sends offline ops one by one via BroadcastChannel. Batching these into a single message would be more performant.                                                                                             |
