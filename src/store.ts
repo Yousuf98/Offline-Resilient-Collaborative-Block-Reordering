@@ -75,19 +75,47 @@ const bc = new BroadcastChannel("block-editor-sync");
 
 // Lexicographic fractional indexing generator
 function generatePosition(prev: string | null, next: string | null): string {
-  const p = prev || "";
-  const n = next || "";
+  const CHARSET =
+    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const BASE = CHARSET.length;
+  // Logic to create a smaller value by prepending characters
+  function getSmaller(next: string): string {
+    const firstChar = next[0];
+    const idx = CHARSET.indexOf(firstChar);
+    if (idx > 0) return CHARSET[idx - 1] + "Z"; // Move to previous char, add high buffer
+    return "0" + next; // If at 0, prepend 0 to allow further negative space
+  }
+
+  // Logic to create a larger value by appending characters
+  function getLarger(prev: string): string {
+    const lastChar = prev[prev.length - 1];
+    const idx = CHARSET.indexOf(lastChar);
+    if (idx < BASE - 1) return prev.slice(0, -1) + CHARSET[idx + 1];
+    return prev + "0"; // Append 0 to allow further positive space
+  }
+  // 1. Handle Boundaries
+  if (prev === null && next === null) return "Z";
+  if (prev === null) return getSmaller(next!);
+  if (next === null) return getLarger(prev!);
+
+  // 2. Midpoint Calculation
+  let result = "";
   let i = 0;
   while (true) {
-    const pChar = p.charCodeAt(i) || 96; // 'a' - 1
-    const nChar = n.charCodeAt(i) || 123; // 'z' + 1
-    if (nChar - pChar > 1) {
-      return (
-        p.substring(0, i) + String.fromCharCode(Math.floor((pChar + nChar) / 2))
-      );
+    const p = i < prev.length ? CHARSET.indexOf(prev[i]) : 0;
+    const n = i < next.length ? CHARSET.indexOf(next[i]) : BASE;
+
+    if (n - p > 1) {
+      // Space found, take the midpoint
+      result += CHARSET[Math.floor((p + n) / 2)];
+      break;
+    } else {
+      // No space, append the character from prev and continue
+      result += CHARSET[p];
+      i++;
     }
-    i++;
   }
+  return result;
 }
 
 interface EditorState {
